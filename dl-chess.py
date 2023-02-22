@@ -104,6 +104,7 @@ class ChessNN(nn.Module):
                 torch.cat(stm).to(device)
             )
             return y_hat
+            
 
 def load_raw_nnue(filename: str) -> None:
     """Convert a .nnue file into a PyTorch model."""
@@ -279,31 +280,39 @@ def play_vs_stockfish(elo: int, rounds: int) -> None:
 
         outcome = board.outcome()
         while outcome is None:
+            print('.', end='', flush=True)
             if board.turn == chess_nn_color:
-                
-                nnue_score = None
-                move_idx = 0
-
-                # Depth-3 search
                 moves = list(board.legal_moves)
+                y_hat = chess_nn.play(board, moves)
+                move_scores = -y_hat
+
+                # Depth-2 search
                 for i, move in enumerate(moves):
                     board.push(move)
-
-                    for move in board.legal_moves:
-                        board.push(move)
-
-                        y_hat = chess_nn.play(board, list(board.legal_moves))
-                        # Select the minimum score because it's the opponent's turn after 3 moves
+                    moves2 = list(board.legal_moves)
+                    if moves2:
+                        y_hat = chess_nn.play(board, moves2)
+                        # Opponent will choose the move that minimizes ChessNN's board score
                         best = y_hat.min(0)
+                        # Update the estimate
+                        if move_scores[i] > best[0]:
+                            move_scores[i] = best[0]
 
-                        if nnue_score is None or best[0] < nnue_score:
-                            nnue_score = best[0]
-                            move_idx = i
+                        # Depth-3 search
+                        for move2 in moves2:
+                            board.push(move2)
+                            moves3 = list(board.legal_moves)
+                            if moves3:
+                                y_hat = chess_nn.play(board, moves3)
+                                our_best = y_hat.min(0)
+                                our_best_score = -our_best[0]
+                                if move_scores[i] > our_best_score:
+                                    move_scores[i] = our_best_score
+                            board.pop()
 
-                        board.pop()
-                    
                     board.pop()
 
+                move_idx = move_scores.max(0)[1]
                 move = moves[move_idx]
             else:
                 clock_idx = chess_nn_color == chess.WHITE
@@ -317,7 +326,6 @@ def play_vs_stockfish(elo: int, rounds: int) -> None:
                     white_inc=clock_inc,
                     black_inc=clock_inc
                 )
-                limit = chess.engine.Limit(time=0.001)
 
                 start = time.time()
                 result = opponent.play(board, limit, game=game_num)
@@ -387,4 +395,4 @@ def play_vs_stockfish(elo: int, rounds: int) -> None:
 if __name__ == '__main__':
     # load_raw_nnue('nn-97f742aaefcd.nnue')
     # verify()
-    play_vs_stockfish(1350, 3)
+    play_vs_stockfish(1500, 5)
