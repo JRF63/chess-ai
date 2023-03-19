@@ -1,3 +1,4 @@
+import math
 import time
 
 import numpy as np
@@ -47,7 +48,8 @@ def get_halfkp_features(board: chess.Board) -> tuple[torch.Tensor, torch.Tensor]
         tensor = torch.sparse_coo_tensor(
             [[0 for _ in range(len(indices))], indices],
             torch.ones(len(indices)),
-            (1, NUM_FEATURES)
+            (1, NUM_FEATURES),
+            device=device
         )
         return tensor
 
@@ -78,33 +80,76 @@ class ChessNN(nn.Module):
         l3_x = torch.clamp(self.l2(l2_x), 0.0, 1.0)
         return self.l3(l3_x)
 
-    def play(self, board: chess.Board, moves: list[chess.Move]):
-        white_features = []
-        black_features = []
-        stm = []
-        for move in moves:
+    def play(self, board: chess.Board) -> chess.Move:
+        return self.find_best_move(board, 4, board.turn)
+
+    def find_best_move(self, board: chess.Board, depth: int, color: chess.Color) -> chess.Move:
+        best_move = None
+        max_eval = -math.inf
+        alpha = -math.inf
+        beta = math.inf
+        for move in board.legal_moves:
             board.push(move)
-
-            w, b = get_halfkp_features(board)
-
-            white_features.append(w)
-            black_features.append(b)
-
-            if board.turn == chess.WHITE:
-                blend = torch.ones((1, 2 * M))
-            else:
-                blend = torch.zeros((1, 2 * M))
-            stm.append(blend)
+            eval = self.alpha_beta_pruning(
+                board, depth - 1, alpha, beta, False, color)
             board.pop()
+            if best_move is None or eval > max_eval:
+                max_eval = eval
+                best_move = move
+            alpha = max(alpha, eval)
+        return best_move
+
+    def evaluate(self, board: chess.Board, color: chess.Color) -> float:
+        w, b = get_halfkp_features(board)
+
+        if board.turn == chess.WHITE:
+            stm = torch.ones(1, 2 * M, device=device)
+        else:
+            stm = torch.zeros(1, 2 * M, device=device)
 
         with torch.no_grad():
-            y_hat = self.forward(
-                torch.cat(white_features).to(device),
-                torch.cat(black_features).to(device),
-                torch.cat(stm).to(device)
-            )
-            return y_hat
-            
+            output = self.forward(w, b, stm)
+            if board.turn != color:
+                output = -output
+            return output
+
+    def alpha_beta_pruning(
+        self,
+        board: chess.Board,
+        depth: int,
+        alpha: float,
+        beta: float,
+        maximizing_player: bool,
+        color: chess.Color
+    ) -> float:
+        if depth == 0:
+            return self.evaluate(board, color)
+
+        if maximizing_player:
+            max_eval = -math.inf
+            for move in board.legal_moves:
+                board.push(move)
+                eval = self.alpha_beta_pruning(
+                    board, depth - 1, alpha, beta, False, color)
+                board.pop()
+                max_eval = max(max_eval, eval)
+                alpha = max(alpha, eval)
+                if beta <= alpha:
+                    break
+            return max_eval
+        else:
+            min_eval = math.inf
+            for move in board.legal_moves:
+                board.push(move)
+                eval = self.alpha_beta_pruning(
+                    board, depth - 1, alpha, beta, True, color)
+                board.pop()
+                min_eval = min(min_eval, eval)
+                beta = min(beta, eval)
+                if beta <= alpha:
+                    break
+            return min_eval
+
 
 def load_raw_nnue(filename: str) -> None:
     """Convert a .nnue file into a PyTorch model."""
@@ -116,60 +161,68 @@ def load_raw_nnue(filename: str) -> None:
         version = int.from_bytes(f.read(4), 'little')
         hash_value = int.from_bytes(f.read(4), 'little')
         size = int.from_bytes(f.read(4), 'little')
-        architecture = f.read(size).decode("utf-8") 
+        architecture = f.read(size).decode("utf-8")
 
-        print(f'Version: {hex(version)}') # 0x7af32f16
-        print(f'Hash value: {hex(hash_value)}') # 0x3e5aa6ee
+        print(f'Version: {hex(version)}')  # 0x7af32f16
+        print(f'Hash value: {hex(hash_value)}')  # 0x3e5aa6ee
         print(f'Architecture: {architecture}')
         print('')
-        
+
         # Feature Transformer
         ft_input_dim = 41024
         ft_output_dim = 256
         ft_input_type_size = 2
         ft_output_type_size = 2
         ft_hash = int.from_bytes(f.read(4), 'little')
-        ft_biases = np.frombuffer(f.read(ft_output_dim * ft_output_type_size), dtype=np.dtype('<i2')).astype('float32')
-        ft_weights = np.frombuffer(f.read(ft_output_dim * ft_input_dim * ft_input_type_size), dtype=np.dtype('<i2')).astype('float32')
-        print(f'Feature Transformer hash: {hex(ft_hash)}') # 0x5d69d7b8
+        ft_biases = np.frombuffer(f.read(
+            ft_output_dim * ft_output_type_size), dtype=np.dtype('<i2')).astype('float32')
+        ft_weights = np.frombuffer(f.read(
+            ft_output_dim * ft_input_dim * ft_input_type_size), dtype=np.dtype('<i2')).astype('float32')
+        print(f'Feature Transformer hash: {hex(ft_hash)}')  # 0x5d69d7b8
         print(ft_biases)
         print(ft_weights)
         print('')
 
         network_hash = int.from_bytes(f.read(4), 'little')
-        print(f'Network hash: {hex(network_hash)}') # 0x63337156
+        print(f'Network hash: {hex(network_hash)}')  # 0x63337156
 
         # Hidden Layer 1
-        l1_input_dim = 512 # Same with/without padding
+        l1_input_dim = 512  # Same with/without padding
         l1_output_dim = 32
         l1_input_type_size = 1
         l1_output_type_size = 4
-        l1_biases = np.frombuffer(f.read(l1_output_dim * l1_output_type_size), dtype=np.dtype('<i4')).astype('float32')
-        l1_weights = np.frombuffer(f.read(l1_output_dim * l1_input_dim * l1_input_type_size), dtype=np.dtype('<i1')).astype('float32')
+        l1_biases = np.frombuffer(f.read(
+            l1_output_dim * l1_output_type_size), dtype=np.dtype('<i4')).astype('float32')
+        l1_weights = np.frombuffer(f.read(
+            l1_output_dim * l1_input_dim * l1_input_type_size), dtype=np.dtype('<i1')).astype('float32')
         print('    Hidden Layer #1')
         print('   ', l1_biases)
         print('   ', l1_weights)
         print('')
 
         # Hidden Layer 2
-        l2_input_dim = 32 # Same with/without padding
+        l2_input_dim = 32  # Same with/without padding
         l2_output_dim = 32
         l2_input_type_size = 1
         l2_output_type_size = 4
-        l2_biases = np.frombuffer(f.read(l2_output_dim * l2_output_type_size), dtype=np.dtype('<i4')).astype('float32')
-        l2_weights = np.frombuffer(f.read(l2_output_dim * l2_input_dim * l2_input_type_size), dtype=np.dtype('<i1')).astype('float32')
+        l2_biases = np.frombuffer(f.read(
+            l2_output_dim * l2_output_type_size), dtype=np.dtype('<i4')).astype('float32')
+        l2_weights = np.frombuffer(f.read(
+            l2_output_dim * l2_input_dim * l2_input_type_size), dtype=np.dtype('<i1')).astype('float32')
         print('    Hidden Layer #2')
         print('   ', l2_biases)
         print('   ', l2_weights)
         print('')
 
         # Hidden Layer 3
-        l3_input_dim = 32 # Same with/without padding
+        l3_input_dim = 32  # Same with/without padding
         l3_output_dim = 1
         l3_input_type_size = 1
         l3_output_type_size = 4
-        l3_biases = np.frombuffer(f.read(l3_output_dim * l3_output_type_size), dtype=np.dtype('<i4')).astype('float32')
-        l3_weights = np.frombuffer(f.read(l3_output_dim * l3_input_dim * l3_input_type_size), dtype=np.dtype('<i1')).astype('float32')
+        l3_biases = np.frombuffer(f.read(
+            l3_output_dim * l3_output_type_size), dtype=np.dtype('<i4')).astype('float32')
+        l3_weights = np.frombuffer(f.read(
+            l3_output_dim * l3_input_dim * l3_input_type_size), dtype=np.dtype('<i1')).astype('float32')
         print('    Hidden Layer #3')
         print('   ', l3_biases)
         print('   ', l3_weights)
@@ -178,7 +231,7 @@ def load_raw_nnue(filename: str) -> None:
         assert len(f.read()) == 0
 
         chess_nn = ChessNN()
-        
+
         with torch.no_grad():
             ft_weights /= 127
             ft_biases /= 127
@@ -211,6 +264,7 @@ def load_raw_nnue(filename: str) -> None:
 
             print(f'Converting {filename} to {NNUE_FILENAME}')
             torch.save(chess_nn.state_dict(), NNUE_FILENAME)
+
 
 def verify() -> None:
     """Verify the output of the PyTorch model against the output of the quantized NNUE in Stockfish
@@ -252,7 +306,9 @@ def verify() -> None:
             output = chess_nn.forward(w, b, stm)
             scaled = float(output * stockfish_scaling_factor)
             percent_diff = float(abs((scaled - score) / score)) * 100.0
-            print(f"PyTorch: {scaled:8.2f}  |  NNUE: {score:5}  |  % diff.: {percent_diff:5.2f}")
+            print(
+                f"PyTorch: {scaled:8.2f}  |  NNUE: {score:5}  |  % diff.: {percent_diff:5.2f}")
+
 
 def play_vs_stockfish(elo: int, rounds: int) -> None:
     """Test the neural net against an Elo-limited Stockfish"""
@@ -267,7 +323,7 @@ def play_vs_stockfish(elo: int, rounds: int) -> None:
 
     # Recent Stockfish's `UCI_Elo` is calibrated against time control 120.0s+1.0s, old versions are
     # using 60.0s+0.6s.
-    clocks = [120.0, 120.0] # [White's, Black's]
+    clocks = [120.0, 120.0]  # [White's, Black's]
     clock_inc = 1.0
 
     score_table = [0, 0]
@@ -282,50 +338,20 @@ def play_vs_stockfish(elo: int, rounds: int) -> None:
         while outcome is None:
             print('.', end='', flush=True)
             if board.turn == chess_nn_color:
-                moves = list(board.legal_moves)
-                y_hat = chess_nn.play(board, moves)
-                move_scores = -y_hat
-
-                # Depth-2 search
-                for i, move in enumerate(moves):
-                    board.push(move)
-                    moves2 = list(board.legal_moves)
-                    if moves2:
-                        y_hat = chess_nn.play(board, moves2)
-                        # Opponent will choose the move that minimizes ChessNN's board score
-                        best = y_hat.min(0)
-                        # Update the estimate
-                        if move_scores[i] > best[0]:
-                            move_scores[i] = best[0]
-
-                        # Depth-3 search
-                        for move2 in moves2:
-                            board.push(move2)
-                            moves3 = list(board.legal_moves)
-                            if moves3:
-                                y_hat = chess_nn.play(board, moves3)
-                                our_best = y_hat.min(0)
-                                our_best_score = -our_best[0]
-                                if move_scores[i] > our_best_score:
-                                    move_scores[i] = our_best_score
-                            board.pop()
-
-                    board.pop()
-
-                move_idx = move_scores.max(0)[1]
-                move = moves[move_idx]
+                move = chess_nn.play(board)
             else:
                 clock_idx = chess_nn_color == chess.WHITE
 
                 # Increment Stockfish's clock
                 clocks[clock_idx] += clock_inc
 
-                limit = chess.engine.Limit(
-                    white_clock=clocks[0],
-                    black_clock=clocks[1],
-                    white_inc=clock_inc,
-                    black_inc=clock_inc
-                )
+                # limit = chess.engine.Limit(
+                #     white_clock=clocks[0],
+                #     black_clock=clocks[1],
+                #     white_inc=clock_inc,
+                #     black_inc=clock_inc
+                # )
+                limit = chess.engine.Limit(time=0.001)
 
                 start = time.time()
                 result = opponent.play(board, limit, game=game_num)
@@ -339,7 +365,7 @@ def play_vs_stockfish(elo: int, rounds: int) -> None:
                 # to making 1 millisecond moves if it consumes all its time budget.
                 if clocks[clock_idx] < 0:
                     clocks[clock_idx] = 0.001 - clock_inc
-                
+
                 move = result.move
 
             board.push(move)
@@ -385,7 +411,7 @@ def play_vs_stockfish(elo: int, rounds: int) -> None:
 
         print(game)
         print('')
-        
+
     print('Final score:')
     print(f'ChessNN: {score_table[0]}, Stockfish-Elo{elo}: {score_table[1]}')
 
@@ -395,4 +421,4 @@ def play_vs_stockfish(elo: int, rounds: int) -> None:
 if __name__ == '__main__':
     # load_raw_nnue('nn-97f742aaefcd.nnue')
     # verify()
-    play_vs_stockfish(1500, 5)
+    play_vs_stockfish(1500, 1)
